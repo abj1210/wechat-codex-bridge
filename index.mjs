@@ -447,6 +447,8 @@ async function handleMessage(msg) {
       workdir,
       autoApprove: !!config.autoApprove,
       skipGitRepoCheck: config.skipGitRepoCheck !== false,
+      sandboxMode: config.sandboxMode,
+      networkAccess: config.networkAccess !== false,
       resumeSessionId,
       resumeLast,
       onProgress: (partial) => {
@@ -475,6 +477,8 @@ async function handleMessage(msg) {
           workdir,
           autoApprove: !!config.autoApprove,
           skipGitRepoCheck: config.skipGitRepoCheck !== false,
+          sandboxMode: config.sandboxMode,
+          networkAccess: config.networkAccess !== false,
         });
         if (fallback.sessionId) {
           codexSessions[userId] = fallback.sessionId;

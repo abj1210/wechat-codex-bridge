@@ -11,11 +11,20 @@ Wechaty error: AssertionError [ERR_ASSERTION]: 1 == 0
 
 这通常表示微信服务端拒绝了 Web 协议登录（常见 `ret 1203` / 登录环境异常），不是本项目代码问题，继续修补 `wechat4u` 意义不大。iLink 协议是腾讯官方面向个人号 Bot 的接口，当前支持 **私聊消息和媒体，不支持群聊**。
 
+## 最近更新
+
+- 支持配置 Codex 沙盒模式与网络访问能力。
+- 支持按用户加载/继续历史 Codex 会话。
+- 每条提问包含问题内容的确认消息，并按消息 ID 去重。
+- 增加单实例锁，防止多个进程同时回复。
+- 支持 Windows 前台运行与登录自动启动任务。
+
 ## 设计原则
 
 - **工作目录可指定**：`config.json` 设默认值，微信会话内可用 `/cd <目录>` 切换。
-- **模型 / 沙盒 / 权限继承当前配置**：桥接只传 `-C <目录>`，不传 `-m`、不传 `-s`，也不传任何审批旁路参数；Codex 按 `~/.codex/config.toml` 的当前配置运行。
-- `--skip-git-repo-check` 只放宽「必须是 git 仓库」这一条，不改变模型、沙盒或权限。
+- **模型继承当前配置**：桥接不传 `-m`，Codex 仍使用 `~/.codex/config.toml` 里的模型。
+- **沙盒与网络可配置**：`config.json` 的 `sandboxMode` 和 `networkAccess` 决定 Codex 执行命令时的沙盒及网络策略。
+- `--skip-git-repo-check` 只放宽「必须是 git 仓库」这一条，不改变模型。
 - 默认 `autoApprove: false`，即不会自动给 Codex 加 `--full-auto`。
 - 每条提问会先回一条包含问题内容的确认消息，并按微信消息 ID 去重，确保同一提问不会在 Codex 中重复运行。
 
@@ -42,10 +51,12 @@ npm install
 | `allowedWorkdirs` | 工作目录白名单，空数组表示不限制 | `[]` |
 | `autoApprove` | `true` 时给 codex 加 `--full-auto`。默认关闭，遵循当前配置 | `false` |
 | `skipGitRepoCheck` | 允许在非 git 目录运行 | `true` |
+| `sandboxMode` | Codex 沙盒模式：`read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
+| `networkAccess` | `true` 时允许 workspace-write 沙盒访问网络 | `true` |
 | `replyMaxLength` | 单条微信回复最大字符数，超出分段发送 | `4000` |
 | `whitelist` | 允许使用机器人的 `from_user_id`，空数组表示不限制 | `[]` |
 
-模型、沙盒、审批权限不在这里配置，直接改 `~/.codex/config.toml`。
+模型仍直接继承 `~/.codex/config.toml`；沙盒和网络策略由上方 `sandboxMode`、`networkAccess` 控制。
 
 完整示例：
 
@@ -58,6 +69,8 @@ npm install
   ],
   "autoApprove": false,
   "skipGitRepoCheck": true,
+  "sandboxMode": "workspace-write",
+  "networkAccess": true,
   "replyMaxLength": 4000,
   "whitelist": [
     "你的微信 userId"
@@ -144,8 +157,8 @@ state/bridge.lock           单实例锁
 
 ## 安全注意事项
 
-- 保持 `autoApprove: false`，让 Codex 沿用当前配置的审批与沙箱策略。
-- 给 `~/.codex/config.toml` 配置合适的沙箱（`read-only` / `workspace-write`），不要把工作目录设为敏感目录。
+- 保持 `autoApprove: false`，避免自动绕过审批。
+- 在 `config.json` 中根据需求设置 `sandboxMode` 和 `networkAccess`；不要把工作目录设为敏感目录。
 - 用 `whitelist` 限制谁能触发机器人。iLink 场景中填入登录后日志里的 `userId`。
 - `state/` 已加入 `.gitignore`，不要把 token 或 `~/.codex/config.toml` 的 API key 提交到仓库。
 - 个人号扫码登录存在风控/封号风险，请使用小号或测试号。
@@ -185,6 +198,58 @@ tail -f logs/bridge.log
 ```
 
 服务文件里的用户名、项目路径、Node 路径如与实际环境不同，请先修改 `deploy/wechat-codex-bridge.service`。
+
+## Windows 运行方式
+
+Windows 上没有 systemd，推荐用 Windows 任务计划程序实现登录后自动启动，并配合脚本运行。
+
+前置条件：
+
+- 安装 Node.js 22+ 和 Codex CLI。
+- 确保 `codex`、`node` 命令在 PowerShell / CMD 中可用。
+
+首次前台登录：
+
+```powershell
+cd C:\path\to\wechat-codex-bridge
+npm install
+npm start
+```
+
+手机微信扫码成功并看到“登录成功”后，按 `Ctrl-C` 退出。
+
+前台运行脚本：
+
+```bat
+start-windows.bat
+```
+
+安装登录自动启动任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-windows-service.ps1
+```
+
+移除任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-windows-service.ps1
+```
+
+手动启动任务：
+
+```powershell
+Start-ScheduledTask -TaskName wechat-codex-bridge
+```
+
+查看状态：
+
+```powershell
+Get-ScheduledTask -TaskName wechat-codex-bridge
+Get-ScheduledTaskInfo -TaskName wechat-codex-bridge
+```
+
+代码已使用 `cross-spawn` 兼容 Windows 下的 `codex.cmd` 启动；路径处理使用 Node 的 `path` 模块，工作目录、状态文件在 Windows 下同样可用。
 
 ## 常见问题
 

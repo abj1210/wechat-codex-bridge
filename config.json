@@ -3,6 +3,8 @@
   "allowedWorkdirs": [],
   "autoApprove": false,
   "skipGitRepoCheck": true,
+  "sandboxMode": "workspace-write",
+  "networkAccess": true,
   "replyMaxLength": 4000,
   "whitelist": []
 }

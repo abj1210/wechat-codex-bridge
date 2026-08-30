@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -78,9 +78,8 @@ export function parseCodexEventLine(line) {
 }
 
 /**
- * 通过子进程调用本机 codex exec，继承当前 ~/.codex/config.toml 的
- * 模型 / 沙盒 / 权限配置。这里只显式指定工作目录与 JSON 输出，
- * 不传 -m / -s / 审批旁路参数。
+ * 通过子进程调用本机 codex exec。默认继承 ~/.codex/config.toml 的模型；
+ * 仅当调用方显式传入 sandboxMode / networkAccess 时才覆盖沙盒与网络配置。
  */
 export function runCodex({
   prompt,
@@ -91,6 +90,8 @@ export function runCodex({
   timeoutMs = 30 * 60 * 1000,
   resumeSessionId,
   resumeLast = false,
+  sandboxMode,
+  networkAccess = false,
 }) {
   return new Promise((resolve, reject) => {
     if (!existsSync(workdir)) {
@@ -115,6 +116,16 @@ export function runCodex({
       args = ['exec', '--json', '--color', 'never', '-C', workdir];
     }
     args.push('-o', lastMsgFile);
+    if (sandboxMode) {
+      if (isResume) {
+        args.push('-c', `sandbox_mode=${sandboxMode}`);
+      } else {
+        args.push('-s', sandboxMode);
+      }
+    }
+    if (networkAccess && sandboxMode === 'workspace-write') {
+      args.push('-c', 'sandbox_workspace_write.network_access=true');
+    }
     if (skipGitRepoCheck) {
       // 仅跳过「必须是 git 仓库」检查，不改变模型 / 沙盒 / 权限。
       args.push('--skip-git-repo-check');
