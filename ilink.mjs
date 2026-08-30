@@ -243,7 +243,7 @@ export async function waitForWeixinLogin({
           `\n${status === 'expired' ? '二维码已过期' : '验证码多次错误'}，正在刷新二维码（${refreshCount}/${maxQRRefresh}）...\n`,
         );
         try {
-          const next = await fetchQRCode(DEFAULT_BASE_URL, botType);
+          const next = await fetchQRCode(currentBaseUrl, botType);
           currentQrcode = next.qrcode;
           const qrUrl = next.qrcode_img_content || next.qrcode;
           await (onQR ? onQR(qrUrl) : displayQRCode(qrUrl));
@@ -293,6 +293,13 @@ export function isUserTextMessage(msg) {
   return extractText(msg).trim().length > 0;
 }
 
+export function isApiError(resp) {
+  return (
+    (resp?.ret !== undefined && resp.ret !== 0) ||
+    (resp?.errcode !== undefined && resp.errcode !== 0)
+  );
+}
+
 export async function sendMessageWeixin({
   baseUrl,
   token,
@@ -318,8 +325,9 @@ export async function sendMessageWeixin({
     timeoutMs: 15_000,
     label: 'sendMessage',
   });
-  if (resp?.ret && resp.ret !== 0) {
-    throw new Error(`sendMessage ret=${resp.ret} errmsg=${resp.errmsg ?? '(none)'}`);
+  if (isApiError(resp)) {
+    const code = resp.errcode ?? resp.ret;
+    throw new Error(`sendMessage error code=${code} errmsg=${resp.errmsg ?? '(none)'}`);
   }
   return resp;
 }

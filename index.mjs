@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve, isAbsolute, join } from 'node:path';
+import { dirname, resolve, isAbsolute, join, relative } from 'node:path';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
@@ -31,6 +31,7 @@ const config = JSON.parse(readFileSync(join(here, 'config.json'), 'utf8'));
 
 const workdirByUser = new Map();
 const running = new Set();
+const userQueues = new Map();
 const contextTokens = new Map(Object.entries(loadJson(contextTokensFile, {})));
 const typingTickets = new Map();
 const codexSessions = loadJson(codexSessionsFile, {});
@@ -173,7 +174,11 @@ function normalizeWorkdir(p) {
   }
   if (config.allowedWorkdirs?.length) {
     const ok = config.allowedWorkdirs.some(
-      (a) => resolve(a) === dir || dir.startsWith(resolve(a) + '/'),
+      (a) => {
+        const root = resolve(a);
+        const rel = relative(root, dir);
+        return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+      },
     );
     if (!ok) return { error: `目录不在白名单内: ${dir}` };
   }
@@ -181,7 +186,7 @@ function normalizeWorkdir(p) {
 }
 
 function getWorkdir(userId) {
-  return workdirByUser.get(userId) || config.workdir;
+  return resolve(workdirByUser.get(userId) || config.workdir);
 }
 
 function isAllowed(userId) {
@@ -256,20 +261,26 @@ function helpText() {
   ].join('\n');
 }
 
+function loginBaseUrl() {
+  const envBase = process.env.ILINK_BASE_URL?.trim();
+  return envBase ? normalizeBaseUrl(envBase) : DEFAULT_BASE_URL;
+}
+
 async function ensureLogin() {
   let current = loadAuth();
   if (current?.token) return current;
 
+  const baseUrl = loginBaseUrl();
   process.stdout.write('未找到 iLink token，开始二维码登录...\n');
   const started = await startWeixinLogin({
-    baseUrl: DEFAULT_BASE_URL,
+    baseUrl,
     botType: process.env.ILINK_BOT_TYPE || DEFAULT_BOT_TYPE,
   });
   await displayQRCode(started.qrcodeUrl);
 
   const result = await waitForWeixinLogin({
     qrcode: started.qrcode,
-    baseUrl: DEFAULT_BASE_URL,
+    baseUrl,
     botType: process.env.ILINK_BOT_TYPE || DEFAULT_BOT_TYPE,
     onQR: displayQRCode,
   });
@@ -501,6 +512,24 @@ async function handleMessage(msg) {
   }
 }
 
+function enqueueMessage(msg) {
+  const userId = String(msg.from_user_id || '');
+  if (!userId || !isUserTextMessage(msg)) return;
+
+  const previous = userQueues.get(userId) || Promise.resolve();
+  const task = previous.catch(() => {}).then(() => handleMessage(msg));
+  userQueues.set(userId, task);
+  task
+    .catch((err) => {
+      console.error(`[weixin] 处理消息失败: ${err?.stack || err}`);
+    })
+    .finally(() => {
+      if (userQueues.get(userId) === task) {
+        userQueues.delete(userId);
+      }
+    });
+}
+
 async function pollLoop() {
   let getUpdatesBuf = loadSyncBuf();
   let longPollTimeoutMs = 35_000;
@@ -568,24 +597,23 @@ async function pollLoop() {
 
     for (const msg of resp?.msgs || []) {
       if (isUserTextMessage(msg)) {
-        await handleMessage(msg).catch((err) => {
-          console.error(`[weixin] 处理消息失败: ${err?.stack || err}`);
-        });
+        enqueueMessage(msg);
       }
     }
   }
 }
 
 async function relogin() {
+  const baseUrl = loginBaseUrl();
   process.stdout.write('\n请重新扫描二维码登录微信机器人...\n');
   const started = await startWeixinLogin({
-    baseUrl: DEFAULT_BASE_URL,
+    baseUrl,
     botType: process.env.ILINK_BOT_TYPE || DEFAULT_BOT_TYPE,
   });
   await displayQRCode(started.qrcodeUrl);
   const result = await waitForWeixinLogin({
     qrcode: started.qrcode,
-    baseUrl: DEFAULT_BASE_URL,
+    baseUrl,
     botType: process.env.ILINK_BOT_TYPE || DEFAULT_BOT_TYPE,
     onQR: displayQRCode,
   });
@@ -614,6 +642,12 @@ process.stdout.write(
   `已启动。accountId=${auth.accountId} userId=${auth.userId ?? '(未知)'} ` +
     `baseUrl=${auth.baseUrl}\n模型/沙盒/权限继承当前 Codex 配置，workdir=${config.workdir}\n`,
 );
+
+if (!config.whitelist?.length) {
+  console.warn(
+    '[安全提示] config.whitelist 为空，任何能私聊到机器人的微信号都可触发 Codex。建议填写登录后日志中的 userId。',
+  );
+}
 
 pollLoop().catch((err) => {
   console.error('主循环退出:', err);

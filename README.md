@@ -22,28 +22,35 @@ Wechaty error: AssertionError [ERR_ASSERTION]: 1 == 0
 - 每条提问包含问题内容的确认消息，并按消息 ID 去重。
 - 增加单实例锁，防止多个进程同时回复。
 - 支持 Windows 前台运行与登录自动启动任务。
+- 默认工作目录改为跨平台的项目目录 `.`，并修复 Windows 白名单路径判断。
+- `autoApprove` 改用当前 Codex CLI 的 `--approve-for-me`。
+- 不同用户消息可并发处理，同一用户仍按顺序排队。
+- 首次登录和重新登录支持 `ILINK_BASE_URL`，发送消息统一检查 `ret`/`errcode`。
 
 ## 设计原则
 
-- **工作目录可指定**：`config.json` 设默认值，微信会话内可用 `/cd <目录>` 切换。
+- **工作目录可指定**：`config.json` 设默认值，`.` 表示项目目录；微信会话内可用 `/cd <目录>` 切换。
 - **模型继承当前配置**：桥接不传 `-m`，Codex 仍使用 `~/.codex/config.toml` 里的模型。
 - **沙盒与网络可配置**：`config.json` 的 `sandboxMode` 和 `networkAccess` 决定 Codex 执行命令时的沙盒及网络策略。
 - `--skip-git-repo-check` 只放宽「必须是 git 仓库」这一条，不改变模型。
-- 默认 `autoApprove: false`，即不会自动给 Codex 加 `--full-auto`。
+- 默认 `autoApprove: false`。开启时只对新建会话传入 `--approve-for-me`；`codex exec resume` 不提供该参数。
 - 每条提问会先回一条包含问题内容的确认消息，并按微信消息 ID 去重，确保同一提问不会在 Codex 中重复运行。
 
 ## 依赖
 
 - Node.js 22+（使用全局 `fetch`）
-- 已安装 `codex` 命令且 `codex exec` 可用
+- npm 10+（本项目使用 lockfileVersion 3）
+- 已安装 `codex` 命令且 `codex exec` 可用；验证环境为 Codex CLI 0.151.0
 - `~/.codex/config.toml` 已配置模型（本机当前为 `deepseek-v4-pro`）
 
 安装项目依赖：
 
 ```bash
 cd wechat-codex-bridge
-npm install
+npm ci
 ```
+
+运行时 npm 依赖为 `cross-spawn` 和 `qrcode-terminal`，版本已记录在 `package-lock.json`。
 
 ## 配置
 
@@ -51,9 +58,9 @@ npm install
 
 | 键 | 含义 | 默认 |
 |---|---|---|
-| `workdir` | 默认工作目录 | `/home/jianing/data` |
+| `workdir` | 默认工作目录，`.` 表示项目目录 | `.` |
 | `allowedWorkdirs` | 工作目录白名单，空数组表示不限制 | `[]` |
-| `autoApprove` | `true` 时给 codex 加 `--full-auto`。默认关闭，遵循当前配置 | `false` |
+| `autoApprove` | `true` 时对新建 Codex 会话传 `--approve-for-me`。默认关闭，遵循当前配置 | `false` |
 | `skipGitRepoCheck` | 允许在非 git 目录运行 | `true` |
 | `sandboxMode` | Codex 沙盒模式：`read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `networkAccess` | `true` 时允许 workspace-write 沙盒访问网络 | `true` |
@@ -66,11 +73,8 @@ npm install
 
 ```json
 {
-  "workdir": "/home/jianing/data",
-  "allowedWorkdirs": [
-    "/home/jianing/data",
-    "/home/jianing/projects"
-  ],
+  "workdir": ".",
+  "allowedWorkdirs": [],
   "autoApprove": false,
   "skipGitRepoCheck": true,
   "sandboxMode": "workspace-write",
@@ -83,6 +87,8 @@ npm install
 ```
 
 `allowedWorkdirs` 为空时表示不限制工作目录；填写后 `/cd` 只能切换到列表内目录或其子目录。
+
+路径写法随系统不同：Windows 使用 `D:/code/project` 这类绝对路径，Linux/macOS 使用 `/home/you/project`。`workdir` 设为 `.` 时，项目实际目录由进程工作目录决定，Windows 和 Linux 都不需要为默认值改写平台路径。
 
 ## 运行
 
@@ -112,7 +118,7 @@ npm start
 | 变量 | 含义 | 必填 |
 |---|---|---|
 | `ILINK_BOT_TOKEN` | iLink bot token | 否，已有 `state/auth.json` 时可省略 |
-| `ILINK_BASE_URL` | iLink API 地址 | 否，默认 `https://ilinkai.weixin.qq.com` |
+| `ILINK_BASE_URL` | iLink API 地址，也用于首次扫码登录 | 否，默认 `https://ilinkai.weixin.qq.com` |
 | `ILINK_BOT_ID` | bot/account ID | 否 |
 | `ILINK_USER_ID` | 扫码绑定用户的 userId | 否 |
 | `CODEX_WECHAT_DEBUG` | 非空时打印 Codex 进度调试日志 | 否 |
@@ -161,9 +167,10 @@ state/bridge.lock           单实例锁
 
 ## 安全注意事项
 
-- 保持 `autoApprove: false`，避免自动绕过审批。
+- 保持 `autoApprove: false`，避免自动绕过审批。开启后只使用 `--approve-for-me`，且只作用于新建会话。
 - 在 `config.json` 中根据需求设置 `sandboxMode` 和 `networkAccess`；不要把工作目录设为敏感目录。
 - 用 `whitelist` 限制谁能触发机器人。iLink 场景中填入登录后日志里的 `userId`。
+- 当 `whitelist` 为空时，服务启动会打印安全警告；正式使用前建议填写 `userId`。
 - `state/` 已加入 `.gitignore`，不要把 token 或 `~/.codex/config.toml` 的 API key 提交到仓库。
 - 个人号扫码登录存在风控/封号风险，请使用小号或测试号。
 
@@ -216,7 +223,7 @@ Windows 上没有 systemd，推荐用 Windows 任务计划程序实现登录后�
 
 ```powershell
 cd C:\path\to\wechat-codex-bridge
-npm install
+npm ci
 npm start
 ```
 

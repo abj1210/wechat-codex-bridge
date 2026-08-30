@@ -103,7 +103,7 @@ export function runCodex({
     const isResume = Boolean(resumeSessionId || resumeLast);
     let args;
     if (isResume) {
-      // codex exec resume 不接受 -C / --color / --full-auto；工作目录通过子进程 cwd 传入，
+      // codex exec resume 不接受 -C / --color / --approve-for-me；工作目录通过子进程 cwd 传入，
       // 模型、沙盒、权限继续继承当前 ~/.codex/config.toml。
       args = ['exec', 'resume'];
       if (resumeLast) {
@@ -131,10 +131,12 @@ export function runCodex({
       args.push('--skip-git-repo-check');
     }
     if (autoApprove && !isResume) {
-      // 默认关闭。只有配置显式开启时才自动批准（workspace-write 沙箱）。
-      args.push('--full-auto');
+      // 默认关闭。当前 Codex CLI 已移除 --full-auto，改用自动审批通道。
+      // 该选项只适用于新建会话；resume 子命令不提供 --approve-for-me。
+      args.push('--approve-for-me');
     }
-    if (!isResume) args.push('--');
+    // 用 -- 明确结束参数解析，避免以 - 开头的微信消息被误当作 CLI 选项。
+    args.push('--');
     args.push(prompt);
 
     const child = spawn('codex', args, {

@@ -6,6 +6,7 @@ import {
   extractText,
   isUserTextMessage,
   randomWechatUin,
+  isApiError,
 } from '../ilink.mjs';
 
 test('buildClientVersion encodes major/minor/patch', () => {
@@ -36,4 +37,12 @@ test('randomWechatUin is base64 and changes', () => {
   const b = randomWechatUin();
   assert.ok(Buffer.from(a, 'base64').toString('utf8'));
   assert.notEqual(a, b);
+});
+
+test('isApiError handles ret and errcode', () => {
+  assert.equal(isApiError({ ret: 0 }), false);
+  assert.equal(isApiError({ ret: 1 }), true);
+  assert.equal(isApiError({ errcode: 0 }), false);
+  assert.equal(isApiError({ errcode: -14 }), true);
+  assert.equal(isApiError(null), false);
 });

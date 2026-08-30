@@ -1,5 +1,5 @@
 {
-  "workdir": "/home/jianing/data",
+  "workdir": ".",
   "allowedWorkdirs": [],
   "autoApprove": false,
   "skipGitRepoCheck": true,
