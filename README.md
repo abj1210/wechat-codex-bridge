@@ -1,5 +1,9 @@
 # wechat-codex-bridge
 
+<p align="center">
+  <img src="assets/icon-512.png" width="128" height="128" alt="wechat-codex-bridge icon">
+</p>
+
 把**个人微信号**接到本机 Codex CLI：微信里发消息，交给 `codex exec` 执行，再把结果回发到微信。
 
 本项目已从 Wechaty + `wechaty-puppet-wechat4u`（Web 协议）切换到腾讯官方个人微信 Bot 的 iLink 协议。原方案会在 `webwxinit` 时出现：
