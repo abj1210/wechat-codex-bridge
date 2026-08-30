@@ -1,0 +1,13 @@
+{
+  "name": "wechat-codex-bridge",
+  "version": "0.1.0",
+  "description": "个人微信 -> Codex CLI 桥接服务",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

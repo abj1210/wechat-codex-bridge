@@ -1,0 +1,8 @@
+{
+  "workdir": "/home/jianing/data",
+  "allowedWorkdirs": [],
+  "autoApprove": false,
+  "skipGitRepoCheck": true,
+  "replyMaxLength": 4000,
+  "whitelist": []
+}

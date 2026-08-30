@@ -1,0 +1,22 @@
+[Unit]
+Description=WeChat Codex Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jianing
+Group=jianing
+WorkingDirectory=/home/jianing/data/wechat-codex-bridge
+Environment=HOME=/home/jianing
+Environment=CODEX_HOME=/home/jianing/.codex
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node /home/jianing/data/wechat-codex-bridge/index.mjs
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/jianing/data/wechat-codex-bridge/logs/bridge.log
+StandardError=append:/home/jianing/data/wechat-codex-bridge/logs/bridge.log
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
