@@ -58,12 +58,17 @@ npm ci
 
 | 键 | 含义 | 默认 |
 |---|---|---|
+| `backend` | 处理后端：`python` 或 `node` | `python` |
 | `workdir` | 默认工作目录，`.` 表示项目目录 | `.` |
 | `allowedWorkdirs` | 工作目录白名单，空数组表示不限制 | `[]` |
 | `autoApprove` | `true` 时对新建 Codex 会话传 `--approve-for-me`。默认关闭，遵循当前配置 | `false` |
 | `skipGitRepoCheck` | 允许在非 git 目录运行 | `true` |
 | `sandboxMode` | Codex 沙盒模式：`read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `networkAccess` | `true` 时允许 workspace-write 沙盒访问网络 | `true` |
+| `pythonPreprocess` | 可选：发送给 Codex 前调用的 Python 脚本路径 | `""` |
+| `pythonPostprocess` | 可选：Codex 返回后调用的 Python 脚本路径 | `""` |
+| `pythonHandler` | `backend=python` 时使用的 Python 处理脚本 | `handler.py` |
+| `pythonHandlerTimeoutMs` | `pythonHandler` 的超时时间（毫秒） | `1800000` |
 | `replyMaxLength` | 单条微信回复最大字符数，超出分段发送 | `4000` |
 | `whitelist` | 允许使用机器人的 `from_user_id`，空数组表示不限制 | `[]` |
 
@@ -73,12 +78,17 @@ npm ci
 
 ```json
 {
+  "backend": "python",
   "workdir": ".",
   "allowedWorkdirs": [],
   "autoApprove": false,
   "skipGitRepoCheck": true,
   "sandboxMode": "workspace-write",
   "networkAccess": true,
+  "pythonPreprocess": "",
+  "pythonPostprocess": "",
+  "pythonHandler": "handler.py",
+  "pythonHandlerTimeoutMs": 1800000,
   "replyMaxLength": 4000,
   "whitelist": [
     "你的微信 userId"
@@ -88,7 +98,336 @@ npm ci
 
 `allowedWorkdirs` 为空时表示不限制工作目录；填写后 `/cd` 只能切换到列表内目录或其子目录。
 
+### Python 信息处理钩子
+
+桥接支持在消息进入 Codex 前、以及 Codex 返回后调用 Python 脚本处理信息：
+
+- `pythonPreprocess`：从 stdin 读取原始微信消息，把处理后的 prompt 写到 stdout。
+- `pythonPostprocess`：从 stdin 读取 Codex 返回文本，把处理后的回复写到 stdout。
+
+示例 `preprocess.py`：
+
+```python
+import sys
+
+text = sys.stdin.read()
+print(f"请分析以下内容并给出结论：\n{text}")
+```
+
+配置：
+
+```json
+{
+  "pythonPreprocess": "hooks/preprocess.py",
+  "pythonPostprocess": "hooks/postprocess.py"
+}
+```
+
+脚本路径相对当前用户的工作目录解析；脚本执行超时时间为 60 秒。
+
+### 完全由 Python 调用 Codex
+
+如果配置了 `pythonHandler`，普通微信消息会直接交给该 Python 脚本处理：
+
+```json
+{
+  "pythonHandler": "handler.py"
+}
+```
+
+处理流程：
+
+```text
+微信消息 -> Node 桥接读取 stdin -> python handler.py -> 调用 codex -> stdout -> 微信回复
+```
+
+`handler.py` 示例：
+
+```python
+import os
+import subprocess
+import sys
+
+message = sys.stdin.read()
+workdir = os.environ.get("CODEX_BRIDGE_WORKDIR", os.getcwd())
+
+result = subprocess.run(
+    [
+        "codex", "exec",
+        "--json", "--color", "never",
+        "-C", workdir,
+        "--skip-git-repo-check",
+        "--", message,
+    ],
+    capture_output=True,
+    text=True,
+    timeout=1800,
+)
+
+# 这里可按需解析 stdout，或直接输出最后一行文本。
+print(result.stdout.strip())
+```
+
+桥接会设置以下环境变量供 Python 使用：
+
+- `CODEX_BRIDGE_WORKDIR`：当前用户的工作目录。
+- `CODEX_BRIDGE_USER_ID`：当前微信用户 ID。
+
 路径写法随系统不同：Windows 使用 `D:/code/project` 这类绝对路径，Linux/macOS 使用 `/home/you/project`。`workdir` 设为 `.` 时，项目实际目录由进程工作目录决定，Windows 和 Linux 都不需要为默认值改写平台路径。
+
+### 本地 manager.py
+
+在后台服务离线时，可以用 `manager.py` 部署、运行和管理任务包：
+
+```bash
+python3 manager.py deploy
+python3 manager.py run-once '/help'
+python3 manager.py run-once '只回复两个字：测试'
+python3 manager.py package list
+```
+
+如果后台服务仍在运行，`manager.py` 会拒绝执行，避免与微信桥接进程同时操作 Codex。
+
+### manager.py 交互菜单与后台服务控制
+
+直接运行 `manager.py` 会进入交互式菜单：
+
+```bash
+python3 manager.py menu
+```
+
+交互菜单会根据后台服务状态动态显示“开启/关闭后台服务”选项。进入菜单时若检测到服务正在运行，会先询问是否关闭服务；退出菜单时若服务未运行，会询问是否重新开启服务。
+
+选择“运行一次 handler”后会进入命令子菜单，列出所有已启用任务包中的命令、用法和说明。用户只需要选择命令，再输入该命令后面的参数，无需手动输入 `/` 命令前缀。
+
+选择具体命令后，会先调用该任务包内的 `help(command)` 方法显示具体用法，再提示输入参数。运行结果不再显示原始 JSON，而是按“结果/错误/附件”友好展示。
+
+主菜单现在包含四个子菜单：
+
+```text
+1. 运行一次 handler
+2. 任务包管理
+3. 后台服务管理
+4. 项目安装/卸载
+```
+
+- 任务包管理：列出、添加、删除、启用、禁用、调整顺序。
+- 后台服务管理：查看状态、启动、停止、重启、开启/关闭自启。
+- 项目安装/卸载：安装依赖、部署任务包、安装/卸载后台服务、迁移状态、清理运行状态。
+
+## 通过 manager.py 完成部署与运行
+
+下面是从零开始，用 `manager.py` 部署并运行项目的完整流程。
+
+### 1. 准备环境
+
+确认已安装：
+
+```bash
+python3 --version
+node --version
+npm --version
+codex exec --help
+```
+
+进入项目目录：
+
+```bash
+cd /home/jianing/data/wechat-codex-bridge
+```
+
+### 2. 安装依赖
+
+可以进入交互菜单：
+
+```bash
+python3 manager.py
+```
+
+然后选择：
+
+```text
+4. 项目安装/卸载
+1. 安装项目依赖
+```
+
+也可以直接运行：
+
+```bash
+npm ci
+```
+
+如果本机没有 `package-lock.json`，使用：
+
+```bash
+npm install
+```
+
+### 3. 部署并注册内置任务包
+
+命令行：
+
+```bash
+python3 manager.py deploy
+```
+
+或交互菜单：
+
+```text
+4. 项目安装/卸载
+2. 部署并注册内置任务包
+```
+
+这一步会注册：
+
+```text
+packages/settings
+packages/sessions
+packages/workdir
+```
+
+### 4. 首次登录并获取微信 token
+
+后台服务需要先离线登录一次，生成 `state/auth.json`：
+
+```bash
+npm start
+```
+
+终端会显示二维码，用手机微信扫码确认。看到“登录成功”后按 `Ctrl-C` 退出。
+
+### 5. 迁移旧状态
+
+如果之前使用过 Node 版本，可以执行：
+
+```bash
+python3 manager.py migrate-state
+```
+
+该命令会把旧的 `state/codex-sessions.json` 迁移到：
+
+```text
+packages/sessions/state.json
+```
+
+### 6. 安装后台服务
+
+命令行：
+
+```bash
+sudo bash deploy/install-service.sh
+```
+
+或交互菜单：
+
+```text
+4. 项目安装/卸载
+3. 安装后台服务
+```
+
+安装完成后，`manager.py` 会自动停止刚启动的后台服务，避免与本地管理操作冲突。
+
+### 7. 启动后台服务
+
+交互菜单：
+
+```text
+3. 后台服务管理
+2. 启动后台服务
+```
+
+命令行：
+
+```bash
+python3 manager.py service start
+```
+
+查看状态：
+
+```bash
+python3 manager.py service status
+tail -f logs/bridge.log
+```
+
+### 8. 本地验证
+
+先确保后台服务已停止：
+
+```bash
+python3 manager.py service stop
+```
+
+然后本地运行：
+
+```bash
+python3 manager.py run-once '/help'
+python3 manager.py run-once '只回复两个字：测试'
+```
+
+或者进入交互菜单：
+
+```bash
+python3 manager.py menu
+```
+
+选择：
+
+```text
+1. 运行一次 handler
+```
+
+在子菜单中选择命令并输入参数。
+
+### 9. 管理任务包
+
+```bash
+python3 manager.py package list
+python3 manager.py package add packages/新任务包
+python3 manager.py package enable <包ID>
+python3 manager.py package disable <包ID>
+python3 manager.py package order <包ID> <序号>
+```
+
+或使用交互菜单：
+
+```text
+2. 任务包管理
+```
+
+### 10. 卸载后台服务
+
+交互菜单：
+
+```text
+4. 项目安装/卸载
+5. 卸载后台服务
+```
+
+该操作会停止服务、取消开机自启，并删除 systemd 服务文件。
+
+如果还想清理本地运行状态，可继续选择：
+
+```text
+6. 清理运行状态
+```
+
+也可以通过命令行直接控制后台服务：
+
+```bash
+python3 manager.py service status
+python3 manager.py service start
+python3 manager.py service stop
+python3 manager.py service restart
+python3 manager.py service enable
+python3 manager.py service disable
+```
+
+说明：
+
+- `service enable`：设置后台服务开机自启。
+- `service disable`：关闭后台服务开机自启。
+- Linux 下会优先使用 systemd；Windows 下会尝试使用计划任务。
+- 如果检测不到 systemd / 计划任务，`start` 会提示手动运行 `npm start`。
 
 ## 运行
 

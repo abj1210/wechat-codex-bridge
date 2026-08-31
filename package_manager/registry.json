@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "id": "b2b65072f359438cae77a1db765da043",
+      "name": "settings",
+      "module_name": "settings",
+      "path": "packages/settings",
+      "enabled": true,
+      "commands": [
+        "/config",
+        "/model",
+        "/sandbox",
+        "/network"
+      ],
+      "order": 1,
+      "help": {
+        "/config": "查看当前桥接配置",
+        "/model": "查看 Codex 当前模型",
+        "/sandbox [mode]": "查看或设置沙盒模式",
+        "/network [on|off]": "查看或设置网络访问"
+      },
+      "usage": {
+        "/config": "/config",
+        "/model": "/model",
+        "/sandbox": "/sandbox <read-only|workspace-write|danger-full-access>",
+        "/network": "/network <on|off>"
+      }
+    },
+    {
+      "id": "14ebf7e1797d4a44b3bac406d028c896",
+      "name": "sessions",
+      "module_name": "sessions",
+      "path": "packages/sessions",
+      "enabled": true,
+      "commands": [
+        "/session",
+        "/resume",
+        "/new",
+        "/history"
+      ],
+      "order": 2,
+      "help": {
+        "/session": "查看当前会话",
+        "/resume <id|last>": "加载指定历史会话",
+        "/new": "开始新会话",
+        "/history [n]": "列出最近的 Codex 会话"
+      },
+      "usage": {
+        "/session": "/session",
+        "/resume": "/resume <会话ID|last>",
+        "/new": "/new",
+        "/history": "/history [数量]"
+      }
+    },
+    {
+      "id": "8dd0dfcaf2854475996d4449f7bffeb9",
+      "name": "workdir",
+      "module_name": "workdir",
+      "path": "packages/workdir",
+      "enabled": true,
+      "commands": [
+        "/cd",
+        "/workdir"
+      ],
+      "order": 3,
+      "help": {
+        "/cd <dir>": "设置当前用户的工作目录",
+        "/workdir": "查看当前用户的工作目录"
+      },
+      "usage": {
+        "/cd": "/cd <目录>",
+        "/workdir": "/workdir"
+      }
+    }
+  ]
+}

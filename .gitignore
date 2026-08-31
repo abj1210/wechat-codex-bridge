@@ -1,5 +1,8 @@
 node_modules/
 state/
+runtime/
+__pycache__/
+*.pyc
 *.tgz
 .env
 logs/*.log

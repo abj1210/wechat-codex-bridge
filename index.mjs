@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, isAbsolute, join, relative } from 'node:path';
+import spawn from 'cross-spawn';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
@@ -337,6 +338,119 @@ async function setTyping(userId, contextToken, status) {
   }
 }
 
+function runPythonHook(script, input, workdir, timeoutMs = 60_000, extraEnv = {}) {
+  return new Promise((resolveHook, rejectHook) => {
+    const child = spawn('python3', [script], {
+      cwd: workdir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_BRIDGE_WORKDIR: workdir,
+        ...extraEnv,
+      },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      rejectHook(new Error(`Python 钩子超时: ${script}`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      rejectHook(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolveHook(stdout.trim());
+      } else {
+        rejectHook(new Error(stderr.trim() || `Python 钩子退出码 ${code}`));
+      }
+    });
+
+    child.stdin.end(input ?? '');
+  });
+}
+
+function runPythonBackend(text, workdir, userId) {
+  return new Promise((resolveBackend, rejectBackend) => {
+    const child = spawn('python3', [config.pythonHandler], {
+      cwd: here,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_BRIDGE_PROJECT_ROOT: here,
+        CODEX_BRIDGE_WORKDIR: workdir,
+        CODEX_BRIDGE_USER_ID: userId,
+        CODEX_BRIDGE_MODE: 'wechat',
+      },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      rejectBackend(new Error(`Python 处理程序超时: ${config.pythonHandler}`));
+    }, Number(config.pythonHandlerTimeoutMs) || 30 * 60_000);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      rejectBackend(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        resolveBackend(parsed);
+      } catch {
+        rejectBackend(
+          new Error(stderr.trim() || stdout.trim() || `Python 处理程序退出码 ${code}`),
+        );
+      }
+    });
+
+    child.stdin.end(text ?? '');
+  });
+}
+
+async function handlePythonBackendMessage(userId, text, contextToken) {
+  if (running.has(userId)) {
+    await sendReply(userId, '上一个任务仍在执行，请稍候。', contextToken);
+    return;
+  }
+
+  running.add(userId);
+  const workdir = resolve(config.workdir || '.', here);
+  await sendAck(userId, text, workdir, contextToken, '');
+
+  try {
+    await setTyping(userId, contextToken, 1);
+    const result = await runPythonBackend(text, workdir, userId);
+    await setTyping(userId, contextToken, 2);
+    const final = result?.text?.trim() || '（Python 处理程序未返回文本）';
+    await sendReply(userId, final, contextToken);
+  } catch (err) {
+    await setTyping(userId, contextToken, 2);
+    await sendReply(userId, `执行出错: ${err?.message || err}`, contextToken);
+  } finally {
+    running.delete(userId);
+  }
+}
+
 async function handleMessage(msg) {
   const userId = String(msg.from_user_id || '');
   const text = extractText(msg).trim();
@@ -349,6 +463,11 @@ async function handleMessage(msg) {
     saveContextTokens();
   }
   const contextToken = incomingContextToken || contextTokens.get(userId);
+
+  if (config.backend === 'python' && config.pythonHandler) {
+    await handlePythonBackendMessage(userId, text, contextToken);
+    return;
+  }
 
   if (text === '/help' || text === 'help') {
     await sendReply(userId, helpText(), contextToken);
@@ -443,6 +562,15 @@ async function handleMessage(msg) {
   const savedSession = codexSessions[userId];
   const resumeLast = savedSession === 'last';
   const resumeSessionId = !resumeLast && savedSession ? savedSession : undefined;
+  let promptText = text;
+  if (config.pythonPreprocess) {
+    try {
+      const processed = await runPythonHook(config.pythonPreprocess, text, workdir);
+      if (processed) promptText = processed;
+    } catch (err) {
+      console.error(`[weixin] Python 预处理失败: ${err?.message || err}`);
+    }
+  }
   running.add(userId);
   const resumeDesc = resumeLast
     ? '，恢复最近会话'
@@ -453,27 +581,48 @@ async function handleMessage(msg) {
 
   try {
     await setTyping(userId, contextToken, 1);
-    const { text: result, sessionId } = await runCodex({
-      prompt: text,
-      workdir,
-      autoApprove: !!config.autoApprove,
-      skipGitRepoCheck: config.skipGitRepoCheck !== false,
-      sandboxMode: config.sandboxMode,
-      networkAccess: config.networkAccess !== false,
-      resumeSessionId,
-      resumeLast,
-      onProgress: (partial) => {
-        if (process.env.CODEX_WECHAT_DEBUG) {
-          console.log(`[progress ${userId}] ${String(partial).slice(-160)}`);
+    let final;
+    if (config.pythonHandler) {
+      const handlerTimeout = Number(config.pythonHandlerTimeoutMs) || 30 * 60_000;
+      final = await runPythonHook(
+        config.pythonHandler,
+        promptText,
+        workdir,
+        handlerTimeout,
+        { CODEX_BRIDGE_USER_ID: userId },
+      );
+      if (!final) final = '（Python 处理程序未返回文本）';
+    } else {
+      const { text: result, sessionId } = await runCodex({
+        prompt: promptText,
+        workdir,
+        autoApprove: !!config.autoApprove,
+        skipGitRepoCheck: config.skipGitRepoCheck !== false,
+        sandboxMode: config.sandboxMode,
+        networkAccess: config.networkAccess !== false,
+        resumeSessionId,
+        resumeLast,
+        onProgress: (partial) => {
+          if (process.env.CODEX_WECHAT_DEBUG) {
+            console.log(`[progress ${userId}] ${String(partial).slice(-160)}`);
+          }
+        },
+      });
+      if (sessionId) {
+        codexSessions[userId] = sessionId;
+        saveCodexSessions();
+      }
+      final = result?.trim() || '（Codex 未返回文本）';
+      if (config.pythonPostprocess) {
+        try {
+          const processed = await runPythonHook(config.pythonPostprocess, final, workdir);
+          if (processed) final = processed;
+        } catch (err) {
+          console.error(`[weixin] Python 后处理失败: ${err?.message || err}`);
         }
-      },
-    });
-    if (sessionId) {
-      codexSessions[userId] = sessionId;
-      saveCodexSessions();
+      }
     }
     await setTyping(userId, contextToken, 2);
-    const final = result?.trim() || '（Codex 未返回文本）';
     await sendReply(userId, final, contextToken);
   } catch (err) {
     await setTyping(userId, contextToken, 2);
@@ -484,7 +633,7 @@ async function handleMessage(msg) {
       saveCodexSessions();
       try {
         const fallback = await runCodex({
-          prompt: text,
+          prompt: promptText,
           workdir,
           autoApprove: !!config.autoApprove,
           skipGitRepoCheck: config.skipGitRepoCheck !== false,
