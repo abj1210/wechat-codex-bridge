@@ -3,6 +3,7 @@ state/
 runtime/
 __pycache__/
 *.pyc
+packages/*/state.json
 *.tgz
 .env
 logs/*.log

@@ -10,6 +10,9 @@
   "pythonPostprocess": "",
   "pythonHandler": "handler.py",
   "pythonHandlerTimeoutMs": 1800000,
+  "progressReplies": true,
+  "progressIntervalMs": 600000,
+  "heartbeatMinutes": 10,
   "replyMaxLength": 4000,
   "whitelist": []
 }

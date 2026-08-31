@@ -3,13 +3,25 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .protocol import PROJECT_ROOT, load_json
+from .protocol import PROJECT_ROOT, load_json, save_json
+
+
+class CodexWatchdogTimeout(Exception):
+    pass
+
+
+class CodexStopped(Exception):
+    pass
 
 
 def _load_config() -> dict[str, Any]:
@@ -23,6 +35,22 @@ def _read_last_message(path: Path) -> str:
         return ""
 
 
+def _write_progress(progress_file: str | Path | None, stage: str, detail: str) -> None:
+    if not progress_file:
+        return
+    try:
+        save_json(
+            progress_file,
+            {
+                "stage": stage,
+                "detail": detail,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+    except Exception:
+        pass
+
+
 def run_codex(
     prompt: str,
     workdir: str | Path,
@@ -30,6 +58,9 @@ def run_codex(
     session_id: str | None = None,
     resume_last: bool = False,
     timeout_seconds: int = 30 * 60,
+    progress_file: str | Path | None = None,
+    heartbeat_file: str | Path | None = None,
+    stop_file: str | Path | None = None,
 ) -> dict[str, Any]:
     config = _load_config()
     workdir = str(workdir)
@@ -72,31 +103,89 @@ def run_codex(
     args.append(prompt)
 
     env = os.environ.copy()
-    result = subprocess.run(
-        args,
-        cwd=workdir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
+    stderr_path = tmp_dir / "stderr.log"
+    with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+        process = subprocess.Popen(
+            args,
+            cwd=workdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            start_new_session=(os.name == "posix"),
+        )
+        state = {"text": "", "thread_id": "", "partial": ""}
 
-    text = ""
-    thread_id = ""
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        if ev.get("type") == "thread.started" and ev.get("thread_id"):
-            thread_id = ev["thread_id"]
-        if ev.get("type") == "item.completed" and isinstance(ev.get("item"), dict):
-            item_text = ev["item"].get("text")
-            if isinstance(item_text, str):
-                text = item_text
+        def read_stdout() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("type") == "thread.started" and ev.get("thread_id"):
+                    state["thread_id"] = ev["thread_id"]
+                if ev.get("type") == "item.completed" and isinstance(ev.get("item"), dict):
+                    item_text = ev["item"].get("text")
+                    if isinstance(item_text, str):
+                        state["text"] = item_text
+                        _write_progress(
+                            progress_file,
+                            "codex",
+                            f"已生成回答：{item_text[-120:]}",
+                        )
+                delta = ev.get("delta")
+                if isinstance(delta, str):
+                    state["partial"] += delta
+                    _write_progress(
+                        progress_file,
+                        "codex",
+                        f"正在生成回答：{state['partial'][-120:]}",
+                    )
+                elif ev.get("type") == "tool_call" and isinstance(ev.get("tool_name"), str):
+                    _write_progress(progress_file, "tool", f"正在调用工具：{ev['tool_name']}")
+
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
+        started = time.time()
+        last_seen = started
+        while process.poll() is None:
+            if stop_file and Path(stop_file).exists():
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except Exception:
+                        process.kill()
+                else:
+                    process.kill()
+                process.wait()
+                reader.join(timeout=2)
+                raise CodexStopped("codex stopped")
+            if heartbeat_file:
+                try:
+                    last_seen = max(last_seen, Path(heartbeat_file).stat().st_mtime)
+                except Exception:
+                    pass
+            if time.time() - last_seen > timeout_seconds:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except Exception:
+                        process.kill()
+                else:
+                    process.kill()
+                process.wait()
+                reader.join(timeout=2)
+                raise CodexWatchdogTimeout("codex watchdog timeout")
+            time.sleep(1)
+        reader.join(timeout=2)
+
+    stderr_text = stderr_path.read_text(encoding="utf-8", errors="ignore")
+    text = state["text"]
+    thread_id = state["thread_id"]
 
     last_text = _read_last_message(last_msg)
     if last_text.strip():
@@ -104,8 +193,8 @@ def run_codex(
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"codex exit {result.returncode}")
+    if process.returncode != 0:
+        raise RuntimeError(stderr_text.strip() or f"codex exit {process.returncode}")
 
     return {
         "status": "ok",

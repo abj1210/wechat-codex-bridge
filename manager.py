@@ -210,20 +210,34 @@ def _run_handler(text: str) -> None:
                 "CODEX_BRIDGE_MODE": "local",
             }
         )
-        result = subprocess.run(
+        process = subprocess.Popen(
             [sys.executable, str(PROJECT_ROOT / "handler.py")],
-            input=text,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
             cwd=str(PROJECT_ROOT),
             env=env,
-            timeout=30 * 60,
+            start_new_session=(os.name == "posix"),
         )
         try:
-            reply = json.loads(result.stdout.strip())
+            stdout_text, stderr_text = process.communicate(input=text, timeout=30 * 60)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except Exception:
+                    process.kill()
+            else:
+                process.kill()
+            stdout_text, stderr_text = process.communicate()
+            print("handler 执行超时，已清理相关进程树。")
+            raise SystemExit(1)
+        try:
+            reply = json.loads(stdout_text.strip())
         except Exception:
-            print(result.stdout or result.stderr)
-            raise SystemExit(result.returncode or 1)
+            print(stdout_text or stderr_text)
+            raise SystemExit(process.returncode or 1)
         _print_reply(reply)
 
 
@@ -440,6 +454,19 @@ def _install_dependencies() -> None:
     print("依赖安装完成。")
 
 
+def _login_wechat() -> None:
+    ensure_service_offline()
+    print("即将启动前台登录，请用手机微信扫描终端二维码。")
+    print("登录完成后按 Ctrl-C 退出。")
+    try:
+        subprocess.run(
+            ["node", "index.mjs"],
+            cwd=str(PROJECT_ROOT),
+        )
+    except KeyboardInterrupt:
+        print("\n登录流程已退出。")
+
+
 def _install_service() -> None:
     if os.name == "posix":
         script = PROJECT_ROOT / "deploy" / "install-service.sh"
@@ -517,9 +544,10 @@ def _clean_project_state() -> None:
 def _project_submenu() -> None:
     options = [
         ("deps", "安装项目依赖"),
+        ("login", "首次扫码登录微信"),
         ("deploy", "部署并注册内置任务包"),
-        ("install-service", "安装后台服务"),
         ("migrate-state", "迁移 Node 状态"),
+        ("install-service", "安装后台服务"),
         ("uninstall-service", "卸载后台服务"),
         ("clean-state", "清理运行状态"),
         ("back", "返回上级菜单"),
@@ -540,6 +568,8 @@ def _project_submenu() -> None:
         try:
             if action == "deps":
                 _install_dependencies()
+            elif action == "login":
+                _login_wechat()
             elif action == "deploy":
                 _deploy()
             elif action == "install-service":
@@ -623,6 +653,7 @@ def main() -> None:
 
     sub.add_parser("deploy", help="部署并注册内置任务包")
     sub.add_parser("migrate-state", help="迁移 Node 状态到任务包目录")
+    sub.add_parser("login", help="前台扫码登录个人微信")
     sub.add_parser("menu", help="进入交互式菜单")
     run = sub.add_parser("run", help="进入交互式输入")
     run.add_argument("text", nargs="?", help="要发送给 handler 的文本")
@@ -650,6 +681,8 @@ def main() -> None:
         _deploy()
     elif args.command == "migrate-state":
         _migrate_state()
+    elif args.command == "login":
+        _login_wechat()
     elif args.command == "run-once":
         _run_handler(args.text)
     elif args.command == "run":

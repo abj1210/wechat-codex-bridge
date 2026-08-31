@@ -8,18 +8,20 @@ from shared.protocol import PROJECT_ROOT, load_json, save_json
 
 PACKAGE_INFO = {
     "name": "settings",
-    "commands": ["/config", "/model", "/sandbox", "/network"],
+    "commands": ["/config", "/model", "/sandbox", "/network", "/heartbeat"],
     "help": {
         "/config": "查看当前桥接配置",
         "/model": "查看 Codex 当前模型",
         "/sandbox [mode]": "查看或设置沙盒模式",
         "/network [on|off]": "查看或设置网络访问",
+        "/heartbeat <分钟>": "设置心跳时间，0-30 分钟；0 为静默",
     },
     "usage": {
         "/config": "/config",
         "/model": "/model",
         "/sandbox": "/sandbox <read-only|workspace-write|danger-full-access>",
         "/network": "/network <on|off>",
+        "/heartbeat": "/heartbeat <0-30>",
     },
 }
 
@@ -83,6 +85,21 @@ def process_input(command: str, context: dict[str, Any]) -> dict[str, Any]:
         cfg["networkAccess"] = value
         _save_config(cfg)
         return {"action": "output", "input": f"网络访问已{'开启' if value else '关闭'}", "error": ""}
+
+    if name == "/heartbeat":
+        if not arg:
+            return {"action": "output", "input": f"{cfg.get('heartbeatMinutes', 10)}", "error": ""}
+        try:
+            minutes = int(arg)
+        except ValueError:
+            return {"action": "error", "input": "", "error": "心跳分钟数必须是 0-30 的整数"}
+        if minutes < 0 or minutes > 30:
+            return {"action": "error", "input": "", "error": "心跳分钟数必须在 0-30 之间"}
+        cfg["heartbeatMinutes"] = minutes
+        _save_config(cfg)
+        if minutes == 0:
+            return {"action": "output", "input": "心跳已设为静默，但仍会内部刷新超时计时器", "error": ""}
+        return {"action": "output", "input": f"心跳时间已设置为 {minutes} 分钟", "error": ""}
 
     return {"action": "error", "input": "", "error": f"未知设置命令: {command}"}
 

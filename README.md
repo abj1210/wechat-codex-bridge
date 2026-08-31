@@ -26,6 +26,13 @@ Wechaty error: AssertionError [ERR_ASSERTION]: 1 == 0
 - `autoApprove` 改用当前 Codex CLI 的 `--approve-for-me`。
 - 不同用户消息可并发处理，同一用户仍按顺序排队。
 - 首次登录和重新登录支持 `ILINK_BASE_URL`，发送消息统一检查 `ret`/`errcode`。
+- 新增 Python 后端 `handler.py`、任务包管理器和 `manager.py` 交互式 CLI。
+- 任务包支持 settings / sessions / workdir / control 四类扩展。
+- 增加心跳看门狗模式，心跳会刷新 Codex 超时计时。
+- 支持 `/heartbeat`、`/pause`、`/continue`、`/stop` 等控制命令。
+- `/pause` 期间静默进度，但内部继续刷新超时，并缓冲最终回复。
+- 修复确认消息中工作目录与会话名称读取错误。
+- 会话任务包支持 `/rename` 重命名。
 
 ## 设计原则
 
@@ -69,6 +76,8 @@ npm ci
 | `pythonPostprocess` | 可选：Codex 返回后调用的 Python 脚本路径 | `""` |
 | `pythonHandler` | `backend=python` 时使用的 Python 处理脚本 | `handler.py` |
 | `pythonHandlerTimeoutMs` | `pythonHandler` 的超时时间（毫秒） | `1800000` |
+| `progressReplies` | `true` 时在 Codex 运行期间定期发送进度消息 | `true` |
+| `progressIntervalMs` | 进度消息发送间隔（毫秒） | `600000` |
 | `replyMaxLength` | 单条微信回复最大字符数，超出分段发送 | `4000` |
 | `whitelist` | 允许使用机器人的 `from_user_id`，空数组表示不限制 | `[]` |
 
@@ -89,6 +98,8 @@ npm ci
   "pythonPostprocess": "",
   "pythonHandler": "handler.py",
   "pythonHandlerTimeoutMs": 1800000,
+  "progressReplies": true,
+  "progressIntervalMs": 600000,
   "replyMaxLength": 4000,
   "whitelist": [
     "你的微信 userId"
@@ -97,6 +108,22 @@ npm ci
 ```
 
 `allowedWorkdirs` 为空时表示不限制工作目录；填写后 `/cd` 只能切换到列表内目录或其子目录。
+
+开启 `progressReplies` 后，桥接会在 Codex 执行期间按 `progressIntervalMs` 定期回复类似：
+
+```text
+Codex 仍在处理中，已运行 600 秒
+当前阶段：正在调用 Codex
+```
+
+这只用于避免用户长时间看不到反馈，不会改变 Codex 本身的执行或超时机制。
+
+进度消息会读取 Codex 自身产生的 JSONL 事件，尽量显示实际生成内容或工具调用状态，例如：
+
+```text
+当前阶段：正在生成回答：分析完成后，建议将代码拆分为三个模块...
+当前阶段：正在调用工具：shell
+```
 
 ### Python 信息处理钩子
 
@@ -213,7 +240,7 @@ python3 manager.py menu
 
 - 任务包管理：列出、添加、删除、启用、禁用、调整顺序。
 - 后台服务管理：查看状态、启动、停止、重启、开启/关闭自启。
-- 项目安装/卸载：安装依赖、部署任务包、安装/卸载后台服务、迁移状态、清理运行状态。
+- 项目安装/卸载：按顺序提供“安装依赖 → 首次登录 → 部署任务包 → 迁移状态 → 安装/卸载后台服务 → 清理状态”。
 
 ## 通过 manager.py 完成部署与运行
 
@@ -263,7 +290,33 @@ npm ci
 npm install
 ```
 
-### 3. 部署并注册内置任务包
+### 3. 首次登录并获取微信 token
+
+后台服务需要先离线登录一次，生成 `state/auth.json`：
+
+命令行：
+
+```bash
+python3 manager.py login
+```
+
+交互菜单：
+
+```text
+4. 项目安装/卸载
+2. 首次扫码登录微信
+```
+
+也可以直接运行：
+
+```bash
+npm start
+```
+
+终端会显示二维码，用手机微信扫码确认。看到“登录成功”后按 `Ctrl-C` 退出。
+
+
+### 4. 部署并注册内置任务包
 
 命令行：
 
@@ -275,7 +328,7 @@ python3 manager.py deploy
 
 ```text
 4. 项目安装/卸载
-2. 部署并注册内置任务包
+3. 部署并注册内置任务包
 ```
 
 这一步会注册：
@@ -286,22 +339,19 @@ packages/sessions
 packages/workdir
 ```
 
-### 4. 首次登录并获取微信 token
-
-后台服务需要先离线登录一次，生成 `state/auth.json`：
-
-```bash
-npm start
-```
-
-终端会显示二维码，用手机微信扫码确认。看到“登录成功”后按 `Ctrl-C` 退出。
-
 ### 5. 迁移旧状态
 
 如果之前使用过 Node 版本，可以执行：
 
 ```bash
 python3 manager.py migrate-state
+```
+
+交互菜单：
+
+```text
+4. 项目安装/卸载
+4. 迁移 Node 状态
 ```
 
 该命令会把旧的 `state/codex-sessions.json` 迁移到：
@@ -322,7 +372,7 @@ sudo bash deploy/install-service.sh
 
 ```text
 4. 项目安装/卸载
-3. 安装后台服务
+5. 安装后台服务
 ```
 
 安装完成后，`manager.py` 会自动停止刚启动的后台服务，避免与本地管理操作冲突。
@@ -400,7 +450,7 @@ python3 manager.py package order <包ID> <序号>
 
 ```text
 4. 项目安装/卸载
-5. 卸载后台服务
+6. 卸载后台服务
 ```
 
 该操作会停止服务、取消开机自启，并删除 systemd 服务文件。
@@ -408,7 +458,8 @@ python3 manager.py package order <包ID> <序号>
 如果还想清理本地运行状态，可继续选择：
 
 ```text
-6. 清理运行状态
+4. 项目安装/卸载
+7. 清理运行状态
 ```
 
 也可以通过命令行直接控制后台服务：
@@ -481,6 +532,7 @@ state/bridge.lock           单实例锁
 /history [n] 列出最近的 Codex 会话
 /resume <会话ID|last> 加载指定历史会话
 /session     查看当前会话
+/rename <名称> 重命名当前会话
 /new         开始新会话
 /help        帮助
 ```

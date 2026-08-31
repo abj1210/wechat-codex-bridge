@@ -8,18 +8,20 @@ from shared.protocol import PROJECT_ROOT, load_json, save_json
 
 PACKAGE_INFO = {
     "name": "sessions",
-    "commands": ["/session", "/resume", "/new", "/history"],
+    "commands": ["/session", "/resume", "/new", "/history", "/rename"],
     "help": {
         "/session": "查看当前会话",
         "/resume <id|last>": "加载指定历史会话",
         "/new": "开始新会话",
         "/history [n]": "列出最近的 Codex 会话",
+        "/rename <名称>": "重命名当前会话",
     },
     "usage": {
         "/session": "/session",
         "/resume": "/resume <会话ID|last>",
         "/new": "/new",
         "/history": "/history [数量]",
+        "/rename": "/rename <新名称>",
     },
 }
 
@@ -31,20 +33,41 @@ def help(command: str) -> str:
 
 
 def _state() -> dict[str, Any]:
-    return load_json(STATE_PATH, {"user_sessions": {}})
+    return load_json(STATE_PATH, {"user_sessions": {}, "user_session_names": {}})
 
 
 def get_session(user_id: str) -> str | None:
     return _state().get("user_sessions", {}).get(user_id)
 
 
-def set_session(user_id: str, session_id: str | None) -> None:
+def get_session_name(user_id: str) -> str | None:
+    return _state().get("user_session_names", {}).get(user_id)
+
+
+def set_session_name(user_id: str, name: str) -> None:
+    state = _state()
+    names = state.setdefault("user_session_names", {})
+    names[user_id] = name
+    save_json(STATE_PATH, state)
+
+
+def set_session(
+    user_id: str,
+    session_id: str | None,
+    name: str | None = None,
+    *,
+    force_name: bool = False,
+) -> None:
     state = _state()
     sessions = state.setdefault("user_sessions", {})
+    names = state.setdefault("user_session_names", {})
     if session_id:
         sessions[user_id] = session_id
+        if name and (force_name or user_id not in names):
+            names[user_id] = name
     else:
         sessions.pop(user_id, None)
+        names.pop(user_id, None)
     save_json(STATE_PATH, state)
 
 
@@ -97,6 +120,15 @@ def process_input(command: str, context: dict[str, Any]) -> dict[str, Any]:
             return {"action": "error", "input": "", "error": "用法: /resume <id|last>"}
         set_session(user_id, arg)
         return {"action": "output", "input": f"已设置历史会话: {arg}", "error": ""}
+
+    if name == "/rename":
+        if not arg:
+            return {"action": "error", "input": "", "error": "用法: /rename <新名称>"}
+        if not get_session(user_id):
+            return {"action": "error", "input": "", "error": "当前没有可重命名的会话"}
+        new_name = arg.strip().replace("\n", " ")[:60]
+        set_session_name(user_id, new_name)
+        return {"action": "output", "input": f"会话已重命名为: {new_name}", "error": ""}
 
     if name == "/history":
         try:

@@ -4,11 +4,12 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from package_manager.manager import PackageManager
-from shared.codex_client import run_codex
+from shared.codex_client import CodexStopped, CodexWatchdogTimeout, run_codex
 from shared.protocol import PROJECT_ROOT, RUNTIME_ROOT, final_result, load_json, save_json
 from packages.sessions import package as sessions_package
 from packages.workdir import package as workdir_package
@@ -28,6 +29,17 @@ def _help_text() -> str:
         "可用命令：\n"
         "/config\n/model\n/sandbox [mode]\n/network [on|off]\n"
         "/cd <目录>\n/workdir\n/session\n/resume <id|last>\n/new\n/history [n]\n/help"
+    )
+
+
+def _write_progress(run_dir: Path, stage: str, detail: str = "") -> None:
+    save_json(
+        run_dir / "progress.json",
+        {
+            "stage": stage,
+            "detail": detail,
+            "updated_at": datetime.now().isoformat(),
+        },
     )
 
 
@@ -65,6 +77,9 @@ def _run_package_command(command: str, context: dict[str, Any]) -> dict[str, Any
             workdir_package.get_workdir(context["user_id"]),
             session_id=resume_session_id,
             resume_last=resume_last,
+            progress_file=context.get("progress_file"),
+            heartbeat_file=context.get("heartbeat_file"),
+            stop_file=context.get("stop_file"),
         )
         payload = {
             "source": "codex",
@@ -87,18 +102,28 @@ def _run_normal_message(text: str, context: dict[str, Any]) -> dict[str, Any]:
         workdir_package.get_workdir(context["user_id"]),
         session_id=resume_session_id,
         resume_last=resume_last,
+        progress_file=context.get("progress_file"),
+        heartbeat_file=context.get("heartbeat_file"),
+        stop_file=context.get("stop_file"),
     )
     if codex_output.get("session_id"):
-        sessions_package.set_session(context["user_id"], codex_output["session_id"])
+        sessions_package.set_session(
+            context["user_id"],
+            codex_output["session_id"],
+            name=text.strip().replace("\n", " ")[:60],
+        )
     return final_result("ok", codex_output.get("text", ""))
 
 
 def main() -> int:
     text = sys.stdin.read()
     context = _context()
-    run_id = uuid.uuid4().hex
+    run_id = os.environ.get("CODEX_BRIDGE_RUN_ID") or uuid.uuid4().hex
     run_dir = RUNTIME_ROOT / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    context["progress_file"] = str(run_dir / "progress.json")
+    context["heartbeat_file"] = str(run_dir / "heartbeat.json")
+    context["stop_file"] = str(run_dir / "stop.flag")
 
     input_data = {
         "run_id": run_id,
@@ -109,20 +134,32 @@ def main() -> int:
         "mode": context["mode"],
     }
     save_json(run_dir / "input.json", input_data)
+    _write_progress(run_dir, "starting", "正在解析输入")
 
     try:
         trimmed = text.strip()
         if not trimmed:
             result = final_result("error", "输入为空")
         elif trimmed.startswith("/help"):
+            _write_progress(run_dir, "output", "正在生成帮助信息")
             result = final_result("ok", _help_text())
         elif trimmed.startswith("/"):
+            _write_progress(run_dir, "package", "正在处理任务包命令")
             result = _run_package_command(trimmed, context)
         else:
+            _write_progress(run_dir, "codex", "正在调用 Codex")
             result = _run_normal_message(trimmed, context)
+    except CodexStopped as exc:
+        _write_progress(run_dir, "stopped", str(exc))
+        result = {"status": "stopped", "text": "任务已终止", "attachments": []}
+    except CodexWatchdogTimeout as exc:
+        _write_progress(run_dir, "timeout", str(exc))
+        result = {"status": "timeout", "text": "Codex 执行超时", "attachments": []}
     except Exception as exc:
+        _write_progress(run_dir, "error", str(exc))
         result = final_result("error", str(exc))
 
+    _write_progress(run_dir, "done", "处理完成")
     save_json(run_dir / "final_reply.json", result)
     sys.stdout.write(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") == "ok" else 1

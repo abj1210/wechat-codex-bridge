@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, rmSync } 
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, isAbsolute, join, relative } from 'node:path';
 import spawn from 'cross-spawn';
+import { randomUUID } from 'node:crypto';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
@@ -32,6 +33,8 @@ const config = JSON.parse(readFileSync(join(here, 'config.json'), 'utf8'));
 
 const workdirByUser = new Map();
 const running = new Set();
+const currentProcesses = new Map();
+const interruptedUsers = new Set();
 const userQueues = new Map();
 const contextTokens = new Map(Object.entries(loadJson(contextTokensFile, {})));
 const typingTickets = new Map();
@@ -188,6 +191,64 @@ function normalizeWorkdir(p) {
 
 function getWorkdir(userId) {
   return resolve(workdirByUser.get(userId) || config.workdir);
+}
+
+function pythonStateValue(userId, map) {
+  if (!map) return undefined;
+  const bare = String(userId).replace(/@im\.wechat$/, '');
+  return map[userId] ?? map[`${bare}@im.wechat`] ?? map[bare];
+}
+
+function pythonWorkdirFor(userId) {
+  const state = loadJson(join(here, 'packages', 'workdir', 'state.json'), {});
+  const stored = pythonStateValue(userId, state?.user_workdirs);
+  return stored ? resolve(stored) : resolve(config.workdir || '.', here);
+}
+
+function pythonSessionLabel(userId) {
+  const state = loadJson(join(here, 'packages', 'sessions', 'state.json'), {});
+  const sessionId = pythonStateValue(userId, state?.user_sessions);
+  if (!sessionId) return '新会话';
+  if (sessionId === 'last') return '最近会话';
+  const name = pythonStateValue(userId, state?.user_session_names);
+  return name || sessionId;
+}
+
+function isWorkPaused() {
+  return !!loadJson(join(here, 'packages', 'control', 'state.json'), {})?.paused;
+}
+
+function bufferedRepliesPath(userId) {
+  const safe = Buffer.from(String(userId)).toString('base64url');
+  return join(stateDir, 'buffered-replies', `${safe}.json`);
+}
+
+function appendBufferedReply(userId, text) {
+  const file = bufferedRepliesPath(userId);
+  const list = loadJson(file, []);
+  list.push(text);
+  saveJson(file, list);
+}
+
+async function flushBufferedReplies(userId, contextToken) {
+  const file = bufferedRepliesPath(userId);
+  const list = loadJson(file, []);
+  for (const text of list) {
+    await sendReply(userId, text, contextToken);
+  }
+  if (list.length) saveJson(file, []);
+}
+
+async function interruptCurrentTask(userId, contextToken) {
+  const entry = currentProcesses.get(userId);
+  if (!entry) {
+    await sendReply(userId, '当前没有正在运行的任务。', contextToken);
+    return;
+  }
+  const stopFile = join(here, 'runtime', entry.runId, 'stop.flag');
+  mkdirSync(dirname(stopFile), { recursive: true });
+  writeFileSync(stopFile, JSON.stringify({ stopped_at: Date.now() }));
+  await sendReply(userId, '已打断当前任务。', contextToken);
 }
 
 function isAllowed(userId) {
@@ -348,12 +409,13 @@ function runPythonHook(script, input, workdir, timeoutMs = 60_000, extraEnv = {}
         CODEX_BRIDGE_WORKDIR: workdir,
         ...extraEnv,
       },
+      detached: process.platform !== 'win32',
     });
 
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
-      child.kill('SIGTERM');
+      killProcessTree(child);
       rejectHook(new Error(`Python 钩子超时: ${script}`));
     }, timeoutMs);
 
@@ -380,7 +442,36 @@ function runPythonHook(script, input, workdir, timeoutMs = 60_000, extraEnv = {}
   });
 }
 
-function runPythonBackend(text, workdir, userId) {
+function killProcessTree(child) {
+  if (!child?.pid) return;
+  if (process.platform === 'win32') {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F']);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function heartbeatMtime(runId) {
+  try {
+    return statSync(join(here, 'runtime', runId, 'heartbeat.json')).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function runPythonBackend(text, workdir, userId, runId) {
   return new Promise((resolveBackend, rejectBackend) => {
     const child = spawn('python3', [config.pythonHandler], {
       cwd: here,
@@ -391,15 +482,27 @@ function runPythonBackend(text, workdir, userId) {
         CODEX_BRIDGE_WORKDIR: workdir,
         CODEX_BRIDGE_USER_ID: userId,
         CODEX_BRIDGE_MODE: 'wechat',
+        CODEX_BRIDGE_RUN_ID: runId,
       },
+      detached: process.platform !== 'win32',
     });
+    currentProcesses.set(userId, { child, runId });
 
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      rejectBackend(new Error(`Python 处理程序超时: ${config.pythonHandler}`));
-    }, Number(config.pythonHandlerTimeoutMs) || 30 * 60_000);
+    const timeoutMs = Number(config.pythonHandlerTimeoutMs) || 30 * 60_000;
+    let lastHeartbeat = Date.now();
+    const watchdog = setInterval(() => {
+      const mtime = heartbeatMtime(runId);
+      if (mtime) lastHeartbeat = mtime;
+      if (Date.now() - lastHeartbeat > timeoutMs) {
+        clearInterval(watchdog);
+        killProcessTree(child);
+        const err = new Error(`Python 处理程序超时: ${config.pythonHandler}`);
+        err.code = 'PYTHON_HANDLER_TIMEOUT';
+        rejectBackend(err);
+      }
+    }, 10_000);
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString('utf8');
@@ -408,11 +511,13 @@ function runPythonBackend(text, workdir, userId) {
       stderr += chunk.toString('utf8');
     });
     child.on('error', (err) => {
-      clearTimeout(timer);
+      clearInterval(watchdog);
+      currentProcesses.delete(userId);
       rejectBackend(err);
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
+      clearInterval(watchdog);
+      currentProcesses.delete(userId);
       try {
         const parsed = JSON.parse(stdout.trim());
         resolveBackend(parsed);
@@ -432,23 +537,84 @@ async function handlePythonBackendMessage(userId, text, contextToken) {
     await sendReply(userId, '上一个任务仍在执行，请稍候。', contextToken);
     return;
   }
+  if (isWorkPaused() && !text.startsWith('/')) {
+    await sendReply(userId, '当前工作已暂停，发送 /continue 恢复。', contextToken);
+    return;
+  }
 
   running.add(userId);
-  const workdir = resolve(config.workdir || '.', here);
-  await sendAck(userId, text, workdir, contextToken, '');
+  const workdir = pythonWorkdirFor(userId);
+  const sessionDesc = `，会话：${pythonSessionLabel(userId)}`;
+  const runId = randomUUID();
+  await sendAck(userId, text, workdir, contextToken, sessionDesc);
+
+  let progressTimer;
+  if (config.progressReplies !== false) {
+    const configuredMinutes = Number(config.heartbeatMinutes);
+    const hasHeartbeatSetting = Number.isFinite(configuredMinutes) && configuredMinutes >= 0;
+    const silent = hasHeartbeatSetting && configuredMinutes === 0;
+    const interval = hasHeartbeatSetting
+      ? Math.max(configuredMinutes || 10, 0) * 60_000 || 600_000
+      : Number(config.progressIntervalMs) || 600_000;
+    const startedAt = Date.now();
+    progressTimer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const progress = loadJson(join(here, 'runtime', runId, 'progress.json'), null);
+      const stage = progress?.detail || progress?.stage || '处理中';
+      const heartbeatDir = join(here, 'runtime', runId);
+      mkdirSync(heartbeatDir, { recursive: true });
+      writeFileSync(
+        join(heartbeatDir, 'heartbeat.json'),
+        JSON.stringify({ updated_at: Date.now() }),
+      );
+      if (!silent && !isWorkPaused()) {
+        sendReply(
+          userId,
+          `Codex 仍在处理中，已运行 ${elapsed} 秒\n当前阶段：${stage}`,
+          contextToken,
+        ).catch((progressErr) => {
+          console.error(`[weixin] 发送进度消息失败: ${progressErr?.message || progressErr}`);
+        });
+      }
+    }, interval);
+  }
 
   try {
     await setTyping(userId, contextToken, 1);
-    const result = await runPythonBackend(text, workdir, userId);
+    const result = await runPythonBackend(text, workdir, userId, runId);
     await setTyping(userId, contextToken, 2);
+    if (result?.status === 'timeout') {
+      await sendReply(userId, '执行超时，服务即将重启以清理残留进程。', contextToken);
+      scheduleServiceReset();
+      return;
+    }
     const final = result?.text?.trim() || '（Python 处理程序未返回文本）';
-    await sendReply(userId, final, contextToken);
+    if (isWorkPaused()) {
+      appendBufferedReply(userId, final);
+    } else {
+      await sendReply(userId, final, contextToken);
+    }
   } catch (err) {
     await setTyping(userId, contextToken, 2);
-    await sendReply(userId, `执行出错: ${err?.message || err}`, contextToken);
+    if (interruptedUsers.has(userId)) {
+      interruptedUsers.delete(userId);
+    } else if (err?.code === 'PYTHON_HANDLER_TIMEOUT') {
+      await sendReply(userId, '执行超时，服务即将重启以清理残留进程。', contextToken);
+      scheduleServiceReset();
+    } else {
+      await sendReply(userId, `执行出错: ${err?.message || err}`, contextToken);
+    }
   } finally {
+    if (progressTimer) clearInterval(progressTimer);
     running.delete(userId);
   }
+}
+
+function scheduleServiceReset() {
+  console.error('[weixin] Codex 处理超时，已清理进程树，准备重启服务。');
+  setTimeout(() => {
+    process.exit(1);
+  }, 1500);
 }
 
 async function handleMessage(msg) {
@@ -463,6 +629,15 @@ async function handleMessage(msg) {
     saveContextTokens();
   }
   const contextToken = incomingContextToken || contextTokens.get(userId);
+
+  if (config.backend === 'python' && text === '/continue') {
+    await flushBufferedReplies(userId, contextToken);
+  }
+
+  if (config.backend === 'python' && text === '/stop') {
+    await interruptCurrentTask(userId, contextToken);
+    return;
+  }
 
   if (config.backend === 'python' && config.pythonHandler) {
     await handlePythonBackendMessage(userId, text, contextToken);
