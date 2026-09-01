@@ -25,6 +25,7 @@ Wechaty error: AssertionError [ERR_ASSERTION]: 1 == 0
 - 默认工作目录改为跨平台的项目目录 `.`，并修复 Windows 白名单路径判断。
 - `autoApprove` 改用当前 Codex CLI 的 `--approve-for-me`。
 - 不同用户消息可并发处理，同一用户仍按顺序排队。
+- Codex 执行期间，所有 `/` 开头输入都会作为命令立即处理；若 handler.py 未匹配到命令，则直接返回错误。普通消息会进入该用户的等待队列。
 - 首次登录和重新登录支持 `ILINK_BASE_URL`，发送消息统一检查 `ret`/`errcode`。
 - 新增 Python 后端 `handler.py`、任务包管理器和 `manager.py` 交互式 CLI。
 - 任务包支持 settings / sessions / workdir / control 四类扩展。

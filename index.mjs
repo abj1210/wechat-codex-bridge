@@ -256,6 +256,10 @@ function isAllowed(userId) {
   return config.whitelist.some((id) => String(id) === String(userId));
 }
 
+function isImmediateCommand(text) {
+  return String(text ?? '').startsWith('/');
+}
+
 function chunkText(text, max) {
   const rest = String(text ?? '');
   const limit = Number(max) || 4000;
@@ -532,6 +536,25 @@ function runPythonBackend(text, workdir, userId, runId) {
   });
 }
 
+async function handlePythonImmediateCommand(userId, text, contextToken) {
+  const workdir = pythonWorkdirFor(userId);
+  const runId = randomUUID();
+  try {
+    await setTyping(userId, contextToken, 1);
+    const result = await runPythonBackend(text, workdir, userId, runId);
+    await setTyping(userId, contextToken, 2);
+    if (result?.status === 'timeout') {
+      await sendReply(userId, '命令执行超时。', contextToken);
+      return;
+    }
+    const final = result?.text?.trim() || '（命令未返回结果）';
+    await sendReply(userId, final, contextToken);
+  } catch (err) {
+    await setTyping(userId, contextToken, 2);
+    await sendReply(userId, `执行出错: ${err?.message || err}`, contextToken);
+  }
+}
+
 async function handlePythonBackendMessage(userId, text, contextToken) {
   if (running.has(userId)) {
     await sendReply(userId, '上一个任务仍在执行，请稍候。', contextToken);
@@ -615,6 +638,29 @@ function scheduleServiceReset() {
   setTimeout(() => {
     process.exit(1);
   }, 1500);
+}
+
+async function handleImmediateMessage(msg) {
+  const userId = String(msg.from_user_id || '');
+  const text = extractText(msg).trim();
+  if (!userId || !text || !isAllowed(userId)) return;
+  if (isDuplicateMessage(msg)) return;
+
+  const incomingContextToken = msg.context_token;
+  if (incomingContextToken) {
+    contextTokens.set(userId, incomingContextToken);
+    saveContextTokens();
+  }
+  const contextToken = incomingContextToken || contextTokens.get(userId);
+
+  if (text === '/continue') {
+    await flushBufferedReplies(userId, contextToken);
+  }
+  if (text === '/stop') {
+    await interruptCurrentTask(userId, contextToken);
+    return;
+  }
+  await handlePythonImmediateCommand(userId, text, contextToken);
 }
 
 async function handleMessage(msg) {
@@ -839,6 +885,13 @@ async function handleMessage(msg) {
 function enqueueMessage(msg) {
   const userId = String(msg.from_user_id || '');
   if (!userId || !isUserTextMessage(msg)) return;
+  const text = extractText(msg).trim();
+  if (config.backend === 'python' && isImmediateCommand(text)) {
+    handleImmediateMessage(msg).catch((err) => {
+      console.error(`[weixin] 处理即时命令失败: ${err?.stack || err}`);
+    });
+    return;
+  }
 
   const previous = userQueues.get(userId) || Promise.resolve();
   const task = previous.catch(() => {}).then(() => handleMessage(msg));
